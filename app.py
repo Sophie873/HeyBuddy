@@ -1054,16 +1054,33 @@ def _fallback_agent_reply(prompt: str) -> str:
     return normalized
 
 
+import re as _re
+
+_SENTENCE_SPLIT_RE = _re.compile(r'(?<=[.!?。\n])\s*')
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split text into sentences at punctuation boundaries."""
+    parts = _SENTENCE_SPLIT_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _run_groq_agent(prompt: str, settings: Settings, emit: bool = True) -> str:
-    """Call Groq free API (OpenAI-compatible SDK)."""
+    """Call Groq free API (non-streaming, returns full text)."""
+    sentences = list(_stream_groq_sentences(prompt, settings, emit=emit))
+    return " ".join(sentences) if sentences else ""
+
+
+def _stream_groq_sentences(prompt: str, settings: Settings, emit: bool = True):
+    """Generator: yields complete sentences as they stream from Groq."""
     try:
         from openai import OpenAI
     except Exception:
-        return ""
+        return
 
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
-        return ""
+        return
 
     client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
     messages = [
@@ -1072,29 +1089,7 @@ def _run_groq_agent(prompt: str, settings: Settings, emit: bool = True) -> str:
     ]
 
     try:
-        if settings.groq_stream:
-            chunks: List[str] = []
-            response = client.chat.completions.create(
-                model=settings.groq_model,
-                messages=messages,
-                max_tokens=512,
-                temperature=0.3,
-                stream=True,
-            )
-            if emit:
-                _status("agent", f"groq ({settings.groq_model}):")
-                print("> ", end="", flush=True)
-            for chunk in response:
-                delta = chunk.choices[0].delta.content
-                if not delta:
-                    continue
-                chunks.append(delta)
-                if emit:
-                    print(delta, end="", flush=True)
-            if emit:
-                print()
-            return "".join(chunks).strip() or ""
-        else:
+        if not settings.groq_stream:
             response = client.chat.completions.create(
                 model=settings.groq_model,
                 messages=messages,
@@ -1102,10 +1097,53 @@ def _run_groq_agent(prompt: str, settings: Settings, emit: bool = True) -> str:
                 temperature=0.3,
                 stream=False,
             )
-            return (response.choices[0].message.content or "").strip()
+            full = (response.choices[0].message.content or "").strip()
+            if full:
+                for s in _split_sentences(full):
+                    yield s
+            return
+
+        response = client.chat.completions.create(
+            model=settings.groq_model,
+            messages=messages,
+            max_tokens=512,
+            temperature=0.3,
+            stream=True,
+        )
+        if emit:
+            _status("agent", f"groq ({settings.groq_model}):")
+            print("> ", end="", flush=True)
+
+        buffer = ""
+        for chunk in response:
+            delta = chunk.choices[0].delta.content
+            if not delta:
+                continue
+            buffer += delta
+            if emit:
+                print(delta, end="", flush=True)
+
+            # Check for sentence boundaries in buffer
+            while True:
+                match = _SENTENCE_SPLIT_RE.search(buffer)
+                if not match:
+                    break
+                idx = match.end()
+                sentence = buffer[:idx].strip()
+                buffer = buffer[idx:]
+                if sentence:
+                    yield sentence
+
+        # Flush remaining buffer
+        if emit:
+            print()
+        remaining = buffer.strip()
+        if remaining:
+            yield remaining
+
     except Exception as exc:
         _status("warn", f"Groq API error: {exc}")
-        return ""
+        return
 
 
 def _run_openai_agent(prompt: str, settings: Settings, emit: bool = True) -> str:
@@ -1185,6 +1223,47 @@ def _answer(prompt: str, settings: Settings) -> str:
 
     # 4) local fallback
     return _fallback_agent_reply(prompt)
+
+
+def _answer_stream(prompt: str, settings: Settings):
+    """Generator version of _answer: yields sentences as they arrive.
+    Falls back to yielding the full reply as one chunk for non-Groq providers."""
+    # 1) CLI agent
+    reply = _run_cli_agent(prompt, settings)
+    if reply:
+        if reply.startswith("No AGENT_COMMAND configured."):
+            pass
+        elif reply.startswith("AGENT_COMMAND not found:"):
+            _status("warn", reply)
+        elif reply == "(No output from agent)":
+            _status("warn", "에이전트가 빈 응답을 반환했습니다.")
+        elif not reply.startswith("[agent error]"):
+            for s in _split_sentences(reply):
+                yield s
+            return
+        else:
+            _status("warn", reply)
+
+    # 2) Groq streaming (sentence by sentence)
+    if settings.use_groq:
+        got_any = False
+        for sentence in _stream_groq_sentences(prompt, settings):
+            got_any = True
+            yield sentence
+        if got_any:
+            return
+
+    # 3) OpenAI
+    if settings.use_openai:
+        openai_reply = _run_openai_agent(prompt, settings, emit=settings.openai_stream_print)
+        if openai_reply:
+            for s in _split_sentences(openai_reply):
+                yield s
+            return
+
+    # 4) fallback
+    fallback = _fallback_agent_reply(prompt)
+    yield fallback
 
 
 _HELP_TEXT = """사용 가능한 명령어:
@@ -1325,65 +1404,86 @@ def run_voice(settings: Settings) -> None:
                     continue
 
                 _status("agent", "Running agent...")
-                reply = _answer(payload, settings)
-                session.add_turn(text, reply)
-                _write_log(log_path, "voice", text, "command", payload, reply)
-                _status("agent", f"reply: {reply}")
                 _play_beep(settings, "speak")
 
-                # --- Barge-in: speak async, listen while speaking ---
-                tts.speak_async(reply)
+                # --- Stream sentences: speak each as it arrives ---
+                reply_parts: List[str] = []
+                interrupted = False
 
-                # Listen for interruption while TTS is playing
-                while tts.is_speaking:
-                    try:
-                        barge_audio = recognizer.listen(
-                            source,
-                            timeout=1.0,
-                            phrase_time_limit=settings.phrase_time_limit,
-                        )
-                    except sr.WaitTimeoutError:
-                        continue
-                    except Exception:
+                for sentence in _answer_stream(payload, settings):
+                    reply_parts.append(sentence)
+                    _status("agent", f"speak: {sentence}")
+
+                    tts.speak_async(sentence)
+
+                    # Listen for barge-in while this sentence plays
+                    while tts.is_speaking:
+                        try:
+                            barge_audio = recognizer.listen(
+                                source, timeout=1.0,
+                                phrase_time_limit=settings.phrase_time_limit,
+                            )
+                        except sr.WaitTimeoutError:
+                            continue
+                        except Exception:
+                            break
+
+                        try:
+                            barge_text = stt.recognize(recognizer, barge_audio)
+                        except Exception:
+                            continue
+                        if not barge_text:
+                            continue
+
+                        # User interrupted!
+                        tts.stop()
+                        interrupted = True
+                        _play_beep(settings, "heard")
+                        _status("heard", f"user (barge-in): {barge_text}")
+
+                        barge_action, barge_payload = _resolve_user_input(barge_text, settings)
+                        if barge_action == "exit":
+                            full_reply = " ".join(reply_parts)
+                            session.add_turn(text, full_reply)
+                            _write_log(log_path, "voice", text, "command", payload, full_reply)
+                            _status("info", "Exit keyword detected. Bye.")
+                            session.finish()
+                            print(session.summary_text())
+                            return
+                        if barge_action == "cancel":
+                            _status("info", f"Cancel keyword detected: {barge_payload}")
+                            break
+                        if barge_action == "ignore" or not barge_payload:
+                            break
+
+                        # Save current turn, then process barge-in as new turn
+                        full_reply = " ".join(reply_parts)
+                        session.add_turn(text, full_reply + " [interrupted]")
+                        _write_log(log_path, "voice", text, "command", payload, full_reply)
+
+                        # Process the new input
+                        text = barge_text
+                        payload = barge_payload
+                        reply_parts = []
+                        _status("agent", "Running agent...")
+                        _play_beep(settings, "speak")
+                        for barge_sentence in _answer_stream(barge_payload, settings):
+                            reply_parts.append(barge_sentence)
+                            _status("agent", f"speak: {barge_sentence}")
+                            tts.speak_async(barge_sentence)
+                            tts.wait()
                         break
 
-                    try:
-                        barge_text = stt.recognize(recognizer, barge_audio)
-                    except Exception:
-                        continue
-
-                    if not barge_text:
-                        continue
-
-                    # User spoke! Stop TTS and process the new input
-                    tts.stop()
-                    _play_beep(settings, "heard")
-                    _status("heard", f"user (barge-in): {barge_text}")
-
-                    barge_action, barge_payload = _resolve_user_input(barge_text, settings)
-                    if barge_action == "exit":
-                        _status("info", "Exit keyword detected. Bye.")
-                        session.finish()
-                        print(session.summary_text())
-                        return
-                    if barge_action == "cancel":
-                        _status("info", f"Cancel keyword detected: {barge_payload}")
-                        break
-                    if barge_action == "slash":
-                        result = _handle_slash_command(barge_payload, session)
-                        _status("info", result)
-                        break
-                    if barge_action == "ignore" or not barge_payload:
+                    if interrupted:
                         break
 
-                    _status("agent", "Running agent...")
-                    barge_reply = _answer(barge_payload, settings)
-                    session.add_turn(barge_text, barge_reply)
-                    _write_log(log_path, "voice", barge_text, "command", barge_payload, barge_reply)
-                    _status("agent", f"reply: {barge_reply}")
-                    _play_beep(settings, "speak")
-                    tts.speak_async(barge_reply)
-                    # continue listening for more barge-ins
+                full_reply = " ".join(reply_parts)
+                if not interrupted:
+                    session.add_turn(text, full_reply)
+                    _write_log(log_path, "voice", text, "command", payload, full_reply)
+                elif reply_parts:
+                    session.add_turn(text, full_reply)
+                    _write_log(log_path, "voice", text, "command", payload, full_reply)
     except Exception as exc:
         _status("error", f"Microphone runtime error. Cause: {exc}")
         _fallback_to_text()
