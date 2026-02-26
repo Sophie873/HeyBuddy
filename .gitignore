@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pipcache/
+.piptmp/
+.voice_runtime_test/
+build/
+dist/
+pyi_work/
+pyi_spec/
+release/
+sessions/
+_tmp_*.txt
+.tmp_*.txt
+*.spec
+nul
