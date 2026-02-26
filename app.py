@@ -7,6 +7,7 @@ import os
 import sys
 import shlex
 import subprocess
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -772,36 +773,77 @@ class STTEngine:
             raise RuntimeError(f"STT error: {exc}") from exc
 
 
-def _play_audio_file(path: str) -> None:
-    """Play an mp3/wav file using the best available method."""
-    if os.name == "nt":
-        # Windows: use MCI (built-in, supports mp3)
+class _AudioPlayer:
+    """Stoppable audio player. Plays mp3/wav and can be interrupted mid-playback."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._alias: Optional[str] = None
+        self._process: Optional[subprocess.Popen] = None
+
+    def play(self, path: str) -> None:
+        """Play audio file (blocking). Can be interrupted by calling stop()."""
+        if os.name == "nt":
+            self._play_mci(path)
+        elif sys.platform == "darwin":
+            self._play_subprocess(["afplay", path])
+        else:
+            for cmd in [["ffplay", "-nodisp", "-autoexit"], ["aplay"]]:
+                try:
+                    self._play_subprocess(cmd + [path])
+                    return
+                except Exception:
+                    continue
+
+    def _play_mci(self, path: str) -> None:
         try:
             import ctypes
             winmm = ctypes.windll.winmm
-            alias = "tts_" + str(id(path))
+            alias = "tts_" + uuid.uuid4().hex[:8]
+            with self._lock:
+                self._alias = alias
+            buf = ctypes.create_unicode_buffer(256)
             winmm.mciSendStringW(f'open "{path}" type mpegvideo alias {alias}', None, 0, 0)
             winmm.mciSendStringW(f"play {alias} wait", None, 0, 0)
             winmm.mciSendStringW(f"close {alias}", None, 0, 0)
-            return
         except Exception:
             pass
+        finally:
+            with self._lock:
+                self._alias = None
 
-    if sys.platform == "darwin":
-        # macOS: afplay
+    def _play_subprocess(self, cmd: List[str]) -> None:
         try:
-            subprocess.run(["afplay", path], check=True, capture_output=True, timeout=30)
-            return
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with self._lock:
+                self._process = proc
+            proc.wait(timeout=60)
         except Exception:
             pass
+        finally:
+            with self._lock:
+                self._process = None
 
-    # Linux / fallback: try ffplay or aplay
-    for player in ["ffplay -nodisp -autoexit", "aplay"]:
-        try:
-            subprocess.run(player.split() + [path], check=True, capture_output=True, timeout=30)
-            return
-        except Exception:
-            continue
+    def stop(self) -> None:
+        """Stop playback immediately."""
+        with self._lock:
+            # Windows MCI
+            if self._alias:
+                try:
+                    import ctypes
+                    winmm = ctypes.windll.winmm
+                    winmm.mciSendStringW(f"stop {self._alias}", None, 0, 0)
+                    winmm.mciSendStringW(f"close {self._alias}", None, 0, 0)
+                except Exception:
+                    pass
+                self._alias = None
+            # subprocess (macOS/Linux)
+            if self._process and self._process.poll() is None:
+                try:
+                    self._process.terminate()
+                except Exception:
+                    pass
+                self._process = None
 
 
 class TTSEngine:
@@ -809,6 +851,10 @@ class TTSEngine:
         self.settings = settings
         self.enabled = bool(settings.tts_enabled) and settings.tts_provider not in {"off", "none"}
         self._use_edge = False
+        self._player = _AudioPlayer()
+        self._speaking = False
+        self._speak_thread: Optional[threading.Thread] = None
+        self._tmp_path: Optional[str] = None
 
         if not self.enabled:
             return
@@ -839,8 +885,12 @@ class TTSEngine:
             _status("warn", f"pyttsx3 init failed. voice output disabled. Cause: {exc}")
             self.enabled = False
 
-    def _speak_edge(self, text: str) -> None:
-        """Speak using edge-tts (async, saves to temp file then plays)."""
+    @property
+    def is_speaking(self) -> bool:
+        return self._speaking
+
+    def _edge_generate_and_play(self, text: str) -> None:
+        """Generate edge-tts audio and play (runs in thread)."""
         import asyncio
         import tempfile
 
@@ -849,33 +899,38 @@ class TTSEngine:
         except ImportError:
             return
 
-        async def _generate_and_play():
+        async def _generate():
             tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
             tmp_path = tmp.name
             tmp.close()
-            try:
-                communicate = edge_tts.Communicate(
-                    text,
-                    voice=self.settings.tts_edge_voice,
-                    rate=self.settings.tts_edge_rate,
-                )
-                await communicate.save(tmp_path)
-                _play_audio_file(tmp_path)
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+            self._tmp_path = tmp_path
+            communicate = edge_tts.Communicate(
+                text,
+                voice=self.settings.tts_edge_voice,
+                rate=self.settings.tts_edge_rate,
+            )
+            await communicate.save(tmp_path)
+            return tmp_path
 
         try:
             loop = asyncio.new_event_loop()
-            loop.run_until_complete(_generate_and_play())
+            tmp_path = loop.run_until_complete(_generate())
             loop.close()
+            if self._speaking:
+                self._player.play(tmp_path)
         except Exception as exc:
             _status("warn", f"edge-tts error: {exc}")
+        finally:
+            self._speaking = False
+            if self._tmp_path:
+                try:
+                    os.unlink(self._tmp_path)
+                except Exception:
+                    pass
+                self._tmp_path = None
 
-    def _speak_pyttsx3(self, text: str) -> None:
-        """Speak using pyttsx3 (recreate engine each call to avoid Windows hang)."""
+    def _pyttsx3_play(self, text: str) -> None:
+        """Play using pyttsx3 (runs in thread)."""
         try:
             engine = pyttsx3.init()
             engine.setProperty("rate", self.settings.tts_rate)
@@ -899,14 +954,40 @@ class TTSEngine:
                 engine.stop()
             except Exception:
                 pass
+            self._speaking = False
 
     def speak(self, text: str) -> None:
+        """Speak text (blocking). Use speak_async + stop for barge-in."""
         if not self.enabled or not text:
             return
+        self._speaking = True
         if self._use_edge:
-            self._speak_edge(text)
+            self._edge_generate_and_play(text)
         else:
-            self._speak_pyttsx3(text)
+            self._pyttsx3_play(text)
+
+    def speak_async(self, text: str) -> None:
+        """Start speaking in background thread (non-blocking)."""
+        if not self.enabled or not text:
+            return
+        self.stop()  # stop any previous playback
+        self._speaking = True
+        target = self._edge_generate_and_play if self._use_edge else self._pyttsx3_play
+        self._speak_thread = threading.Thread(target=target, args=(text,), daemon=True)
+        self._speak_thread.start()
+
+    def stop(self) -> None:
+        """Interrupt current speech immediately."""
+        self._speaking = False
+        self._player.stop()
+        if self._speak_thread and self._speak_thread.is_alive():
+            self._speak_thread.join(timeout=1.0)
+        self._speak_thread = None
+
+    def wait(self) -> None:
+        """Wait for async speech to finish."""
+        if self._speak_thread and self._speak_thread.is_alive():
+            self._speak_thread.join()
 
 
 def _build_cli_args(command_template: str, prompt: str) -> List[str]:
@@ -1221,6 +1302,7 @@ def run_voice(settings: Settings) -> None:
 
                 action, payload = _resolve_user_input(text, settings)
                 if action == "exit":
+                    tts.stop()
                     _status("info", "Exit keyword detected. Bye.")
                     break
                 if action == "slash":
@@ -1229,6 +1311,7 @@ def run_voice(settings: Settings) -> None:
                     tts.speak(result)
                     continue
                 if action == "cancel":
+                    tts.stop()
                     _status("info", f"Cancel keyword detected: {payload}")
                     continue
                 if action == "ignore":
@@ -1247,7 +1330,60 @@ def run_voice(settings: Settings) -> None:
                 _write_log(log_path, "voice", text, "command", payload, reply)
                 _status("agent", f"reply: {reply}")
                 _play_beep(settings, "speak")
-                tts.speak(reply)
+
+                # --- Barge-in: speak async, listen while speaking ---
+                tts.speak_async(reply)
+
+                # Listen for interruption while TTS is playing
+                while tts.is_speaking:
+                    try:
+                        barge_audio = recognizer.listen(
+                            source,
+                            timeout=1.0,
+                            phrase_time_limit=settings.phrase_time_limit,
+                        )
+                    except sr.WaitTimeoutError:
+                        continue
+                    except Exception:
+                        break
+
+                    try:
+                        barge_text = stt.recognize(recognizer, barge_audio)
+                    except Exception:
+                        continue
+
+                    if not barge_text:
+                        continue
+
+                    # User spoke! Stop TTS and process the new input
+                    tts.stop()
+                    _play_beep(settings, "heard")
+                    _status("heard", f"user (barge-in): {barge_text}")
+
+                    barge_action, barge_payload = _resolve_user_input(barge_text, settings)
+                    if barge_action == "exit":
+                        _status("info", "Exit keyword detected. Bye.")
+                        session.finish()
+                        print(session.summary_text())
+                        return
+                    if barge_action == "cancel":
+                        _status("info", f"Cancel keyword detected: {barge_payload}")
+                        break
+                    if barge_action == "slash":
+                        result = _handle_slash_command(barge_payload, session)
+                        _status("info", result)
+                        break
+                    if barge_action == "ignore" or not barge_payload:
+                        break
+
+                    _status("agent", "Running agent...")
+                    barge_reply = _answer(barge_payload, settings)
+                    session.add_turn(barge_text, barge_reply)
+                    _write_log(log_path, "voice", barge_text, "command", barge_payload, barge_reply)
+                    _status("agent", f"reply: {barge_reply}")
+                    _play_beep(settings, "speak")
+                    tts.speak_async(barge_reply)
+                    # continue listening for more barge-ins
     except Exception as exc:
         _status("error", f"Microphone runtime error. Cause: {exc}")
         _fallback_to_text()
