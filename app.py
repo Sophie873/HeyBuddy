@@ -602,6 +602,7 @@ class Settings:
     stt_vosk_sample_rate: int = int(os.getenv("VOICE_VOSK_SAMPLE_RATE", "16000"))
     stt_device_index: int = _env_int("VOICE_INPUT_DEVICE_INDEX", -1)
     stt_fallback_to_google: bool = _str_bool("VOICE_STT_FALLBACK", True)
+    stt_groq_model: str = os.getenv("VOICE_STT_GROQ_MODEL", "whisper-large-v3-turbo")
 
     tts_provider: str = os.getenv("VOICE_TTS_PROVIDER", "pyttsx3").strip().lower()
     tts_voice: str = os.getenv("VOICE_TTS_VOICE", "").strip()
@@ -652,9 +653,9 @@ class Settings:
         self.cancel_phrases = _split_csv("VOICE_CANCEL_PHRASES", "취소,cancel,중단")
         self.wake_phrases = _split_csv("VOICE_WAKE_PHRASES", "")
 
-        if self.stt_provider not in {"google", "vosk"}:
-            _status("warn", f"VOICE_STT_PROVIDER '{self.stt_provider}' is not supported. Fallback to google.")
-            self.stt_provider = "google"
+        if self.stt_provider not in {"google", "vosk", "groq"}:
+            _status("warn", f"VOICE_STT_PROVIDER '{self.stt_provider}' is not supported. Fallback to groq.")
+            self.stt_provider = "groq"
 
         if self.tts_provider not in {"pyttsx3", "edge", "edge-tts", "off", "none"}:
             _status("warn", f"VOICE_TTS_PROVIDER '{self.tts_provider}' is not supported. Fallback to pyttsx3.")
@@ -708,6 +709,8 @@ class STTEngine:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._vosk_model = self._load_vosk_model()
+        if settings.stt_provider == "groq":
+            _status("info", f"STT: Groq Whisper ({settings.stt_groq_model})")
 
     def _load_vosk_model(self) -> Optional[object]:
         if self.settings.stt_provider != "vosk":
@@ -734,6 +737,36 @@ class STTEngine:
             _status("warn", f"Failed to load Vosk model: {exc}. Using Google STT fallback.")
             return None
 
+    def _recognize_with_groq(self, audio: "sr.AudioData") -> str:
+        """Send audio to Groq Whisper API for fast transcription."""
+        try:
+            from openai import OpenAI
+        except ImportError:
+            return ""
+
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            return ""
+
+        wav_data = audio.get_wav_data()
+
+        try:
+            client = OpenAI(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=api_key,
+            )
+            # language code: "ko-KR" -> "ko"
+            lang = self.settings.language.split("-")[0] if self.settings.language else "ko"
+            transcription = client.audio.transcriptions.create(
+                model=self.settings.stt_groq_model,
+                file=("audio.wav", wav_data),
+                language=lang,
+            )
+            return (transcription.text or "").strip()
+        except Exception as exc:
+            _status("warn", f"Groq Whisper error: {exc}")
+            return ""
+
     def _recognize_with_vosk(self, audio: "sr.AudioData") -> str:
         if self._vosk_model is None or _VoskKaldiRecognizer is None:
             return ""
@@ -757,6 +790,16 @@ class STTEngine:
             return ""
 
     def recognize(self, recognizer: "sr.Recognizer", audio: "sr.AudioData") -> str:
+        # 1) Groq Whisper (fastest)
+        if self.settings.stt_provider == "groq":
+            text = self._recognize_with_groq(audio)
+            if text:
+                return text
+            if not self.settings.stt_fallback_to_google:
+                return ""
+            _status("warn", "Groq Whisper returned empty. Falling back to Google STT.")
+
+        # 2) Vosk (offline)
         if self.settings.stt_provider == "vosk" and self._vosk_model is not None:
             text = self._recognize_with_vosk(audio)
             if text:
@@ -765,6 +808,7 @@ class STTEngine:
                 return ""
             _status("warn", "Vosk returned empty result. Falling back to Google STT.")
 
+        # 3) Google (default fallback)
         try:
             return recognizer.recognize_google(audio, language=self.settings.language)
         except sr.UnknownValueError:
